@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-from contextlib import suppress
 from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime
 from typing import Dict
@@ -81,6 +80,7 @@ async def forward_tweets(chat: Chat):
                 await asyncio.sleep(seconds)
                 raise TryAgain()
 
+            await bot.send_message(chat.id, text=f"Subscription started")
             async for line in response.content:
                 if not line.strip():
                     continue
@@ -146,6 +146,7 @@ async def auth_code_handler(message: types.Message) -> None:
         access_token_secret=token['oauth_token_secret']
     )
     serialize()
+    forward_tasks[message.chat.id] = asyncio.create_task(subscription_loop(chats[str(message.chat.id)]))
 
     await message.reply(f"Successfully logged in!")
 
@@ -185,13 +186,6 @@ async def delete_rule(query: types.CallbackQuery, callback_data: Dict[str, str])
         body = {'delete': {'ids': [int(callback_data['rule_id'])]}}
         await client.api.tweets.search.stream.rules.post(_json=body)
 
-    chat_id = int(callback_data['chat_id'])
-    if chat_id in forward_tasks:
-        forward_tasks[chat_id].cancel()
-        with suppress(asyncio.CancelledError):
-            await forward_tasks[chat_id]
-    forward_tasks[chat_id] = asyncio.create_task(subscription_loop(chat))
-
     await query.message.edit_text(f"Successfully deleted rule {callback_data['rule_id']}")
 
 
@@ -205,13 +199,6 @@ async def add_rule_handler(message: types.Message) -> None:
     async with client:
         data = {'add': [{'value': message.text.strip()}]}
         await client.api.tweets.search.stream.rules.post(_json=data)
-
-    chat_id = message.chat.id
-    if chat_id in forward_tasks:
-        forward_tasks[chat_id].cancel()
-        with suppress(asyncio.CancelledError):
-            await forward_tasks[chat_id]
-    forward_tasks[chat_id] = asyncio.create_task(subscription_loop(chat))
 
     await message.reply(f"Successfully added rule {message.text}")
 
