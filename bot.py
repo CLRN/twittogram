@@ -10,7 +10,7 @@ from typing import Dict
 import peony.oauth
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.utils.callback_data import CallbackData
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 from peony import BasePeonyClient
 from peony.oauth_dance import get_oauth_token, get_access_token
 
@@ -63,7 +63,7 @@ async def forward_tweets(chat: Chat):
                              api_version="2",
                              suffix="")
 
-    async with ClientSession() as session:
+    async with ClientSession(timeout=ClientTimeout(24 * 60 * 60)) as session:
         url = f"https://api.twitter.com/2/tweets/search/stream"
         prepared = await client.headers.prepare_request('get', url)
         params = {"tweet.fields": "lang",
