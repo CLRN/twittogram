@@ -25,7 +25,7 @@ class Chat:
 
 bot = Bot(token=os.environ['TELEGRAM_BOT_ID'])
 dp = Dispatcher(bot)
-chats: Dict[str, CHATS_PATH] = dict()
+chats: Dict[str, Chat] = dict()
 rule_cb = CallbackData('rule', 'chat_id', 'rule_id', 'action')
 forward_tasks = dict()
 
