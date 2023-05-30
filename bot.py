@@ -52,6 +52,7 @@ def deserialize():
         with open(CHATS_PATH, "r") as fout:
             chats = {k: Chat(**v) for k, v in json.load(fout).items()}
 
+    logging.info(f"{chats=}")
     for chat in chats.values():
         forward_tasks[chat.id] = asyncio.get_event_loop().create_task(subscription_loop(chat))
 
@@ -71,6 +72,7 @@ async def forward_tweets(chat: Chat):
                   "user.fields": "username"}
 
         async with session.get(url, headers=prepared['headers'], params=params) as response:
+            logging.info(f"{response=}")
             if response.status == 429:
                 # too many requests
                 end = datetime.utcfromtimestamp(int(response.headers['x-rate-limit-reset']))
@@ -83,6 +85,7 @@ async def forward_tweets(chat: Chat):
                 if not line.strip():
                     continue
 
+                logging.info(f"{line=}")
                 data = json.loads(line.strip())
                 # print(json.dumps(data, indent=2))
                 text = data["data"]["text"]
