@@ -14,7 +14,7 @@ from aiohttp import ClientSession
 from peony import BasePeonyClient
 from peony.oauth_dance import get_oauth_token, get_access_token
 
-CHATS_PATH = "chats.json"
+CHATS_PATH = os.getenv('CHATS_PATH') or "chats.json"
 
 
 @dataclass
