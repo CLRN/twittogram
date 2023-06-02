@@ -15,6 +15,11 @@ from peony.oauth_dance import get_oauth_token, get_access_token
 
 CHATS_PATH = os.getenv('CHATS_PATH') or "chats.json"
 
+TWEET_PARAMS = {"tweet.fields": "lang",
+                "media.fields": "url",
+                "expansions": "attachments.media_keys,author_id",
+                "user.fields": "username"}
+
 
 @dataclass
 class Chat:
@@ -26,6 +31,7 @@ bot = Bot(token=os.environ['TELEGRAM_BOT_ID'])
 dp = Dispatcher(bot)
 chats: Dict[str, Chat] = dict()
 rule_cb = CallbackData('rule', 'chat_id', 'rule_id', 'action')
+search_cb = CallbackData('search', 'chat_id', 'rule_id')
 forward_tasks = dict()
 
 
@@ -56,21 +62,36 @@ def deserialize():
         forward_tasks[chat.id] = asyncio.get_event_loop().create_task(subscription_loop(chat))
 
 
+async def send_tweet(data: dict, chat: Chat):
+    text = data["data"]["text"]
+    lang = data["data"]["lang"]
+    urls = [i["url"] for i in data.get("includes", {}).get("media", []) if i.get("url")]
+    users = ["@" + i["username"] for i in data.get("includes", {}).get("users", []) if i.get("username")]
+    text = f"{', '.join(users)}: {text}"
+
+    if urls:
+        if len(urls) > 1:
+            media = types.MediaGroup()
+            media.attach_photo(urls[0], caption=text)
+            list(map(media.attach_photo, urls[1:]))
+            await bot.send_media_group(chat.id, media=media)
+        else:
+            await bot.send_photo(chat.id, urls[0], caption=text)
+    else:
+        await bot.send_message(chat.id, text=text)
+
+
 async def forward_tweets(chat: Chat):
     client = BasePeonyClient(**chat.oauth_token,
                              auth=peony.oauth.OAuth2Headers,
                              api_version="2",
                              suffix="")
 
-    async with ClientSession(timeout=ClientTimeout(24 * 60 * 60)) as session:
+    async with ClientSession(timeout=ClientTimeout(0)) as session:
         url = f"https://api.twitter.com/2/tweets/search/stream"
         prepared = await client.headers.prepare_request('get', url)
-        params = {"tweet.fields": "lang",
-                  "media.fields": "url",
-                  "expansions": "attachments.media_keys,author_id",
-                  "user.fields": "username"}
 
-        async with session.get(url, headers=prepared['headers'], params=params) as response:
+        async with session.get(url, headers=prepared['headers'], params=TWEET_PARAMS) as response:
             logging.info(f"{response=}")
             if response.status == 429:
                 # too many requests
@@ -87,23 +108,7 @@ async def forward_tweets(chat: Chat):
 
                 logging.info(f"{line=}")
                 data = json.loads(line.strip())
-                # print(json.dumps(data, indent=2))
-                text = data["data"]["text"]
-                lang = data["data"]["lang"]
-                urls = [i["url"] for i in data.get("includes", {}).get("media", []) if i.get("url")]
-                users = [i["username"] for i in data.get("includes", {}).get("users", []) if i.get("username")]
-                text = f"{', '.join(users)}: {text}"
-
-                if urls:
-                    if len(urls) > 1:
-                        media = types.MediaGroup()
-                        media.attach_photo(urls[0], caption=text)
-                        list(map(media.attach_photo, urls[1:]))
-                        await bot.send_media_group(chat.id, media=media)
-                    else:
-                        await bot.send_photo(chat.id, urls[0], caption=text)
-                else:
-                    await bot.send_message(chat.id, text=text)
+                await send_tweet(data, chat)
 
 
 async def subscription_loop(chat: Chat):
@@ -189,7 +194,57 @@ async def delete_rule(query: types.CallbackQuery, callback_data: Dict[str, str])
     await query.message.edit_text(f"Successfully deleted rule {callback_data['rule_id']}")
 
 
-@dp.message_handler(regexp=r'^\D')
+@dp.message_handler(commands=['search'])
+async def search_menu(message: types.Message):
+    client = BasePeonyClient(**chats[str(message.chat.id)].oauth_token,
+                             auth=peony.oauth.OAuth2Headers,
+                             api_version="2",
+                             suffix="")
+    async with client:
+        resp = await client.api.tweets.search.stream.rules.get()
+
+    if not resp.get('data', []):
+        return await message.reply(f"You have not set up any rules, paste text in the chat to add a rule")
+
+    markup = types.InlineKeyboardMarkup()
+    for term in resp.get('data', []):
+        markup.add(
+            types.InlineKeyboardButton(
+                term["value"],
+                callback_data=search_cb.new(chat_id=message.chat.id, rule_id=term['id'])),
+        )
+
+    await message.reply(f'Pick a rule to use for search', reply_markup=markup)
+
+
+@dp.callback_query_handler(search_cb.filter())
+async def search_by_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
+    await query.answer(f"Fetching rules")
+
+    chat = chats[str(callback_data['chat_id'])]
+    client = BasePeonyClient(**chat.oauth_token,
+                             auth=peony.oauth.OAuth2Headers,
+                             api_version="2",
+                             suffix="")
+    async with client:
+        rules = await client.api.tweets.search.stream.rules.get()
+        rule = next(filter(lambda x: x["id"] == callback_data["rule_id"], rules.data["data"]))
+        tweets = await client.api.tweets.search.recent.get(**TWEET_PARAMS, query=rule["value"])
+
+    await query.answer(f"Posting {len(tweets.data.get('data', []))} recent tweets")
+
+    urls = {i["media_key"]: i["url"] for i in tweets.data.get("includes", {}).get("media", [])}
+    users = {i["id"]: i["username"] for i in tweets.data.get("includes", {}).get("users", [])}
+    for tweet in tweets.data.get('data', []):
+        await send_tweet({"data": tweet,
+                          "includes": {
+                              "media": [{"url": urls.get(key)}
+                                        for key in tweet.get("attachments", {}).get("media_keys", [])],
+                              "users": [{"username": users.get(tweet["author_id"])}],
+                          }}, chat)
+
+
+@dp.message_handler(regexp=r'^[\D/]')
 async def add_rule_handler(message: types.Message) -> None:
     chat = chats[str(message.chat.id)]
     client = BasePeonyClient(**chat.oauth_token,
