@@ -101,7 +101,6 @@ async def forward_tweets(chat: Chat):
                 await asyncio.sleep(seconds)
                 raise TryAgain()
 
-            await bot.send_message(chat.id, text=f"Subscription started")
             async for line in response.content:
                 if not line.strip():
                     continue
