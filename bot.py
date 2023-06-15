@@ -3,15 +3,11 @@ import json
 import logging
 import os
 from dataclasses import dataclass, is_dataclass, asdict
-from datetime import datetime
-from typing import Dict
+from typing import Dict, List
 
-import peony.oauth
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.utils.callback_data import CallbackData
-from aiohttp import ClientSession, ClientTimeout
-from peony import BasePeonyClient
-from peony.oauth_dance import get_oauth_token, get_access_token
+from tweety.bot import Twitter, Tweet
 
 CHATS_PATH = os.getenv('CHATS_PATH') or "chats.json"
 
@@ -24,7 +20,8 @@ TWEET_PARAMS = {"tweet.fields": "lang",
 @dataclass
 class Chat:
     id: int
-    oauth_token: Dict
+    last_sent_id: Dict[str, int]
+    subscriptions: List[str]
 
 
 bot = Bot(token=os.environ['TELEGRAM_BOT_ID'])
@@ -62,12 +59,9 @@ def deserialize():
         forward_tasks[chat.id] = asyncio.get_event_loop().create_task(subscription_loop(chat))
 
 
-async def send_tweet(data: dict, chat: Chat):
-    text = data["data"]["text"]
-    lang = data["data"]["lang"]
-    urls = [i["url"] for i in data.get("includes", {}).get("media", []) if i.get("url")]
-    users = ["@" + i["username"] for i in data.get("includes", {}).get("users", []) if i.get("username")]
-    text = f"{', '.join(users)}: {text}"
+async def send_tweet(data: Tweet, chat: Chat):
+    urls = [m['direct_url'] for m in data.media]
+    text = f"{data.author.username}: {data.text}"
 
     if urls:
         if len(urls) > 1:
@@ -82,32 +76,25 @@ async def send_tweet(data: dict, chat: Chat):
 
 
 async def forward_tweets(chat: Chat):
-    client = BasePeonyClient(**chat.oauth_token,
-                             auth=peony.oauth.OAuth2Headers,
-                             api_version="2",
-                             suffix="")
-
-    async with ClientSession(timeout=ClientTimeout(0)) as session:
-        url = f"https://api.twitter.com/2/tweets/search/stream"
-        prepared = await client.headers.prepare_request('get', url)
-
-        async with session.get(url, headers=prepared['headers'], params=TWEET_PARAMS) as response:
-            logging.info(f"{response=}")
-            if response.status == 429:
-                # too many requests
-                end = datetime.utcfromtimestamp(int(response.headers['x-rate-limit-reset']))
-                seconds = (end - datetime.utcnow()).total_seconds() + 1
-                await bot.send_message(chat.id, text=f"Sleeping for {seconds} seconds until {end.isoformat()}")
-                await asyncio.sleep(seconds)
-                raise TryAgain()
-
-            async for line in response.content:
-                if not line.strip():
+    while True:
+        api = Twitter()
+        for subscription in chat.subscriptions:
+            tweet_id = 0
+            tweet: Tweet
+            for tweet in api.get_tweets(subscription):
+                if not tweet.media:
                     continue
 
-                logging.info(f"{line=}")
-                data = json.loads(line.strip())
-                await send_tweet(data, chat)
+                tweet_id = int(tweet.id)
+                if tweet_id < chat.last_sent_id.get(subscription, 0):
+                    break
+
+                await send_tweet(tweet, chat)
+
+            chat.last_sent_id[subscription] = tweet_id
+
+        serialize()
+        await asyncio.sleep(60)
 
 
 async def subscription_loop(chat: Chat):
@@ -123,56 +110,15 @@ async def subscription_loop(chat: Chat):
             await asyncio.sleep(1)
 
 
-@dp.message_handler(commands=['login'])
-async def login_handler(message: types.Message):
-    token = await get_oauth_token(os.getenv('CONSUMER_KEY'), os.getenv('CONSUMER_SECRET'), "oob")
-    url = "https://api.twitter.com/oauth/authorize?oauth_token=" + token['oauth_token']
-    chats[str(message.chat.id)] = Chat(id=message.chat.id, oauth_token=token)
-    serialize()
-
-    await message.reply(f"Please visit the following [link]({url}) to obtain the key and paste it in the chat",
-                        parse_mode='markdown')
-
-
-@dp.message_handler(regexp=r'^\d{7}')
-async def auth_code_handler(message: types.Message) -> None:
-    token = await get_access_token(
-        os.getenv('CONSUMER_KEY'),
-        os.getenv('CONSUMER_SECRET'),
-        oauth_verifier=message.text.strip(),
-        **chats[str(message.chat.id)].oauth_token
-    )
-
-    chats[str(message.chat.id)].oauth_token = dict(
-        consumer_key=os.getenv('CONSUMER_KEY'),
-        consumer_secret=os.getenv('CONSUMER_SECRET'),
-        access_token=token['oauth_token'],
-        access_token_secret=token['oauth_token_secret']
-    )
-    serialize()
-    forward_tasks[message.chat.id] = asyncio.create_task(subscription_loop(chats[str(message.chat.id)]))
-
-    await message.reply(f"Successfully logged in!")
-
-
 @dp.message_handler(commands=['edit'])
 async def edit_rules(message: types.Message):
-    client = BasePeonyClient(**chats[str(message.chat.id)].oauth_token,
-                             auth=peony.oauth.OAuth2Headers,
-                             api_version="2",
-                             suffix="")
-    async with client:
-        resp = await client.api.tweets.search.stream.rules.get()
-
-    if not resp.get('data', []):
-        return await message.reply(f"You have not set up any rules, paste text in the chat to add a rule")
-
     markup = types.InlineKeyboardMarkup()
-    for term in resp.get('data', []):
+    chat = chats[str(message.chat.id)]
+    for term in chat.subscriptions:
         markup.add(
             types.InlineKeyboardButton(
-                term["value"],
-                callback_data=rule_cb.new(chat_id=message.chat.id, rule_id=term['id'], action='delete')),
+                term,
+                callback_data=rule_cb.new(chat_id=message.chat.id, rule_id=term, action='delete')),
         )
 
     await message.reply(f'Delete subscription rules', reply_markup=markup)
@@ -182,35 +128,25 @@ async def edit_rules(message: types.Message):
 async def delete_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
     await query.answer(f"Deleting rule {callback_data['rule_id']}")
     chat = chats[str(callback_data['chat_id'])]
-    client = BasePeonyClient(**chat.oauth_token,
-                             auth=peony.oauth.OAuth2Headers,
-                             api_version="2",
-                             suffix="")
-    async with client:
-        body = {'delete': {'ids': [int(callback_data['rule_id'])]}}
-        await client.api.tweets.search.stream.rules.post(_json=body)
-
+    chat.subscriptions.remove(callback_data['rule_id'])
+    serialize()
     await query.message.edit_text(f"Successfully deleted rule {callback_data['rule_id']}")
 
 
 @dp.message_handler(commands=['search'])
 async def search_menu(message: types.Message):
-    client = BasePeonyClient(**chats[str(message.chat.id)].oauth_token,
-                             auth=peony.oauth.OAuth2Headers,
-                             api_version="2",
-                             suffix="")
-    async with client:
-        resp = await client.api.tweets.search.stream.rules.get()
-
-    if not resp.get('data', []):
+    if str(message.chat.id) not in chats:
+        chats[str(message.chat.id)] = Chat(id=message.chat.id, last_sent_id={}, subscriptions=[])
+    chat = chats[str(message.chat.id)]
+    if not chat.subscriptions:
         return await message.reply(f"You have not set up any rules, paste text in the chat to add a rule")
 
     markup = types.InlineKeyboardMarkup()
-    for term in resp.get('data', []):
+    for term in chat.subscriptions:
         markup.add(
             types.InlineKeyboardButton(
-                term["value"],
-                callback_data=search_cb.new(chat_id=message.chat.id, rule_id=term['id'])),
+                term,
+                callback_data=search_cb.new(chat_id=message.chat.id, rule_id=term)),
         )
 
     await message.reply(f'Pick a rule to use for search', reply_markup=markup)
@@ -221,38 +157,25 @@ async def search_by_rule(query: types.CallbackQuery, callback_data: Dict[str, st
     await query.answer(f"Fetching rules")
 
     chat = chats[str(callback_data['chat_id'])]
-    client = BasePeonyClient(**chat.oauth_token,
-                             auth=peony.oauth.OAuth2Headers,
-                             api_version="2",
-                             suffix="")
-    async with client:
-        rules = await client.api.tweets.search.stream.rules.get()
-        rule = next(filter(lambda x: x["id"] == callback_data["rule_id"], rules.data["data"]))
-        tweets = await client.api.tweets.search.recent.get(**TWEET_PARAMS, query=rule["value"])
+    api = Twitter()
+    for subscription in chat.subscriptions:
+        for tweet in api.get_tweets(subscription):
+            if not tweet.media:
+                continue
 
-    await query.answer(f"Posting {len(tweets.data.get('data', []))} recent tweets")
-
-    urls = {i["media_key"]: i["url"] for i in tweets.data.get("includes", {}).get("media", [])}
-    users = {i["id"]: i["username"] for i in tweets.data.get("includes", {}).get("users", [])}
-    for tweet in tweets.data.get('data', []):
-        await send_tweet({"data": tweet,
-                          "includes": {
-                              "media": [{"url": urls.get(key)}
-                                        for key in tweet.get("attachments", {}).get("media_keys", [])],
-                              "users": [{"username": users.get(tweet["author_id"])}],
-                          }}, chat)
+            await send_tweet(tweet, chat)
 
 
 @dp.message_handler(regexp=r'^[\D/]')
 async def add_rule_handler(message: types.Message) -> None:
+    if str(message.chat.id) not in chats:
+        chats[str(message.chat.id)] = Chat(id=message.chat.id, last_sent_id={}, subscriptions=[])
+
     chat = chats[str(message.chat.id)]
-    client = BasePeonyClient(**chat.oauth_token,
-                             auth=peony.oauth.OAuth2Headers,
-                             api_version="2",
-                             suffix="")
-    async with client:
-        data = {'add': [{'value': message.text.strip()}]}
-        await client.api.tweets.search.stream.rules.post(_json=data)
+    if message.text not in chat.subscriptions:
+        chat.subscriptions.append(message.text)
+
+    serialize()
 
     await message.reply(f"Successfully added rule {message.text}")
 
