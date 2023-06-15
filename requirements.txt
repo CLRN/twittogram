@@ -1,3 +1,2 @@
 aiogram
-peony-twitter[all]
-
+tweety-ns
