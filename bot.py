@@ -3,11 +3,13 @@ import json
 import logging
 import os
 from dataclasses import dataclass, is_dataclass, asdict
-from typing import Dict, List
+from typing import Dict
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.utils.callback_data import CallbackData
-from tweety.bot import Twitter, Tweet
+from aiohttp import ClientSession
+from tweety.bot import Twitter, UserTweets, Tweet
+from tweety.builder import UrlBuilder
 
 CHATS_PATH = os.getenv('CHATS_PATH') or "chats.json"
 
@@ -21,7 +23,7 @@ TWEET_PARAMS = {"tweet.fields": "lang",
 class Chat:
     id: int
     last_sent_id: Dict[str, int]
-    subscriptions: List[str]
+    subscriptions: Dict[str, int]
 
 
 bot = Bot(token=os.environ['TELEGRAM_BOT_ID'])
@@ -55,8 +57,6 @@ def deserialize():
             chats = {k: Chat(**v) for k, v in json.load(fout).items()}
 
     logging.info(f"{chats=}")
-    for chat in chats.values():
-        forward_tasks[chat.id] = asyncio.get_event_loop().create_task(subscription_loop(chat))
 
 
 async def send_tweet(data: Tweet, chat: Chat):
@@ -75,32 +75,55 @@ async def send_tweet(data: Tweet, chat: Chat):
         await bot.send_message(chat.id, text=text)
 
 
-async def forward_tweets(chat: Chat):
+async def get_tweets(user_id: int):
+    async with ClientSession() as session:
+        async def _call(p: dict):
+            async with session.request(
+                    method=p['method'].lower(),
+                    url=p['url'],
+                    headers=p['headers']) as r:
+                return await r.json()
+
+        builder = UrlBuilder()
+        token = await _call(builder.get_guest_token())
+
+        builder.guest_token = token['guest_token']
+
+        data = await _call(builder.user_tweets(user_id=user_id, replies=False, cursor=None))
+
+    result = list()
+    for entry in UserTweets._get_entries(data):
+        result.extend([Tweet(data, t, None) for t in UserTweets._get_tweet_content_key(entry)])
+
+    return result
+
+
+async def forward_tweets():
     while True:
-        api = Twitter()
-        for subscription in chat.subscriptions:
-            tweet_id = 0
-            tweet: Tweet
-            for tweet in api.get_tweets(subscription):
-                if not tweet.media:
-                    continue
+        to_send = list()
+        for chat in chats.values():
+            results = await asyncio.gather(*list(map(get_tweets, chat.subscriptions.values())))
+            for tweets, user_id in zip(results, chat.subscriptions.values()):
+                last_sent = chat.last_sent_id.get(str(user_id), 0)
+                tweets = filter(lambda x: x.media, tweets)
+                tweets = filter(lambda x: int(x.id) > last_sent, tweets)
+                for tweet in tweets:
+                    to_send.append((chat, tweet, user_id))
 
-                tweet_id = int(tweet.id)
-                if tweet_id < chat.last_sent_id.get(subscription, 0):
-                    break
+        for chat, tweet, user_id in reversed(to_send):
+            await send_tweet(tweet, chat)
+            chat.last_sent_id[str(user_id)] = max(int(tweet.id), chat.last_sent_id.get(str(user_id), 0))
 
-                await send_tweet(tweet, chat)
+        if to_send:
+            serialize()
 
-            chat.last_sent_id[subscription] = tweet_id
-
-        serialize()
         await asyncio.sleep(60)
 
 
-async def subscription_loop(chat: Chat):
+async def subscription_loop():
     while True:
         try:
-            await forward_tweets(chat)
+            await forward_tweets()
         except TryAgain:
             pass
         except asyncio.CancelledError:
@@ -114,11 +137,11 @@ async def subscription_loop(chat: Chat):
 async def edit_rules(message: types.Message):
     markup = types.InlineKeyboardMarkup()
     chat = chats[str(message.chat.id)]
-    for term in chat.subscriptions:
+    for name in chat.subscriptions.keys():
         markup.add(
             types.InlineKeyboardButton(
-                term,
-                callback_data=rule_cb.new(chat_id=message.chat.id, rule_id=term, action='delete')),
+                name,
+                callback_data=rule_cb.new(chat_id=message.chat.id, rule_id=name, action='delete')),
         )
 
     await message.reply(f'Delete subscription rules', reply_markup=markup)
@@ -128,7 +151,7 @@ async def edit_rules(message: types.Message):
 async def delete_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
     await query.answer(f"Deleting rule {callback_data['rule_id']}")
     chat = chats[str(callback_data['chat_id'])]
-    chat.subscriptions.remove(callback_data['rule_id'])
+    chat.subscriptions.pop(callback_data['rule_id'])
     serialize()
     await query.message.edit_text(f"Successfully deleted rule {callback_data['rule_id']}")
 
@@ -136,13 +159,13 @@ async def delete_rule(query: types.CallbackQuery, callback_data: Dict[str, str])
 @dp.message_handler(commands=['search'])
 async def search_menu(message: types.Message):
     if str(message.chat.id) not in chats:
-        chats[str(message.chat.id)] = Chat(id=message.chat.id, last_sent_id={}, subscriptions=[])
+        chats[str(message.chat.id)] = Chat(id=message.chat.id, last_sent_id={}, subscriptions={})
     chat = chats[str(message.chat.id)]
     if not chat.subscriptions:
         return await message.reply(f"You have not set up any rules, paste text in the chat to add a rule")
 
     markup = types.InlineKeyboardMarkup()
-    for term in chat.subscriptions:
+    for term in chat.subscriptions.keys():
         markup.add(
             types.InlineKeyboardButton(
                 term,
@@ -158,8 +181,8 @@ async def search_by_rule(query: types.CallbackQuery, callback_data: Dict[str, st
 
     chat = chats[str(callback_data['chat_id'])]
     api = Twitter()
-    for subscription in chat.subscriptions:
-        for tweet in api.get_tweets(subscription):
+    for name in chat.subscriptions.keys():
+        for tweet in api.get_tweets(name):
             if not tweet.media:
                 continue
 
@@ -169,11 +192,10 @@ async def search_by_rule(query: types.CallbackQuery, callback_data: Dict[str, st
 @dp.message_handler(regexp=r'^[\D/]')
 async def add_rule_handler(message: types.Message) -> None:
     if str(message.chat.id) not in chats:
-        chats[str(message.chat.id)] = Chat(id=message.chat.id, last_sent_id={}, subscriptions=[])
+        chats[str(message.chat.id)] = Chat(id=message.chat.id, last_sent_id={}, subscriptions={})
 
     chat = chats[str(message.chat.id)]
-    if message.text not in chat.subscriptions:
-        chat.subscriptions.append(message.text)
+    chat.subscriptions[message.text] = Twitter().get_user_info(message.text).rest_id
 
     serialize()
 
@@ -184,4 +206,5 @@ if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s:%(levelname)s:%(name)s:%(message)s')
     logging.getLogger().setLevel(logging.INFO)
     deserialize()
+    asyncio.get_event_loop().create_task(subscription_loop())
     executor.start_polling(dp, skip_updates=True)
