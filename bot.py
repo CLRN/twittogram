@@ -148,7 +148,7 @@ async def edit_rules(message: types.Message):
     for name in chat.subscriptions.keys():
         markup.add(
             types.InlineKeyboardButton(
-                name,
+                f"{name} {', '.join(chat.filters.get(name, []))}",
                 callback_data=edit_subscription.new(chat_id=message.chat.id, name=name, action='edit')),
         )
 
@@ -208,11 +208,11 @@ async def search_menu(message: types.Message):
         return await message.reply(f"You have not set up any rules, paste text in the chat to add a rule")
 
     markup = types.InlineKeyboardMarkup()
-    for term in chat.subscriptions.keys():
+    for name in chat.subscriptions.keys():
         markup.add(
             types.InlineKeyboardButton(
-                term,
-                callback_data=search_cb.new(chat_id=message.chat.id, subscription=term)),
+                f"{name} {', '.join(chat.filters.get(name, []))}",
+                callback_data=search_cb.new(chat_id=message.chat.id, subscription=name)),
         )
 
     await message.reply(f'Pick a rule to use for search', reply_markup=markup)
