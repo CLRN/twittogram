@@ -188,12 +188,14 @@ async def add_filter(query: types.CallbackQuery, callback_data: Dict[str, str]):
     await query.message.reply(f"Send your filter text")
     chat = chats[str(callback_data['chat_id'])]
     chat.awaiting_filter = callback_data['subscription']
+    serialize()
 
 
 @dp.callback_query_handler(edit_filter.filter(action='delete'))
 async def delete_filter(query: types.CallbackQuery, callback_data: Dict[str, str]):
     chat = chats[str(callback_data['chat_id'])]
     chat.filters[callback_data['subscription']].remove(callback_data['value'])
+    serialize()
     await query.message.reply(f"Removed {callback_data['value']} from filters")
 
 
