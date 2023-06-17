@@ -2,8 +2,8 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, is_dataclass, asdict
-from typing import Dict
+from dataclasses import dataclass, is_dataclass, asdict, field
+from typing import Dict, List
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.utils.callback_data import CallbackData
@@ -24,12 +24,15 @@ class Chat:
     id: int
     last_sent_id: Dict[str, int]
     subscriptions: Dict[str, int]
+    filters: Dict[str, List[str]] = field(default_factory=lambda: {})
+    awaiting_filter: str = ''
 
 
 bot = Bot(token=os.environ['TELEGRAM_BOT_ID'])
 dp = Dispatcher(bot)
 chats: Dict[str, Chat] = dict()
-rule_cb = CallbackData('rule', 'chat_id', 'rule_id', 'action')
+edit_subscription = CallbackData('subscription', 'chat_id', 'name', 'action')
+edit_filter = CallbackData('filter', 'chat_id', 'subscription', 'action', 'value')
 search_cb = CallbackData('search', 'chat_id', 'rule_id')
 forward_tasks = dict()
 
@@ -75,7 +78,7 @@ async def send_tweet(data: Tweet, chat: Chat):
         await bot.send_message(chat.id, text=text)
 
 
-async def get_tweets(user_id: int):
+async def get_tweets(user_id: int) -> List[Tweet]:
     async with ClientSession() as session:
         async def _call(p: dict):
             async with session.request(
@@ -103,10 +106,15 @@ async def forward_tweets():
         to_send = list()
         for chat in chats.values():
             results = await asyncio.gather(*list(map(get_tweets, chat.subscriptions.values())))
-            for tweets, user_id in zip(results, chat.subscriptions.values()):
+            for tweets, (user_name, user_id) in zip(results, chat.subscriptions.items()):
+                filters = chat.filters.get(user_name, [])
+
                 last_sent = chat.last_sent_id.get(str(user_id), 0)
                 tweets = filter(lambda x: x.media, tweets)
                 tweets = filter(lambda x: int(x.id) > last_sent, tweets)
+                tweets = filter(lambda x: not filters or any(map(lambda term: term.lower() in x.text.lower(), filters)),
+                                tweets)
+
                 for tweet in tweets:
                     to_send.append((chat, tweet, user_id))
 
@@ -141,19 +149,52 @@ async def edit_rules(message: types.Message):
         markup.add(
             types.InlineKeyboardButton(
                 name,
-                callback_data=rule_cb.new(chat_id=message.chat.id, rule_id=name, action='delete')),
+                callback_data=edit_subscription.new(chat_id=message.chat.id, name=name, action='edit')),
         )
 
     await message.reply(f'Delete subscription rules', reply_markup=markup)
 
 
-@dp.callback_query_handler(rule_cb.filter(action='delete'))
-async def delete_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
-    await query.answer(f"Deleting rule {callback_data['rule_id']}")
+@dp.callback_query_handler(edit_subscription.filter(action='edit'))
+async def edit_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
+    await query.answer(f"Editing filters for subscription {callback_data['name']}")
     chat = chats[str(callback_data['chat_id'])]
-    chat.subscriptions.pop(callback_data['rule_id'])
-    serialize()
-    await query.message.edit_text(f"Successfully deleted rule {callback_data['rule_id']}")
+
+    markup = types.InlineKeyboardMarkup()
+    for filter_term in chat.filters.get(callback_data['name'], []):
+        markup.add(
+            types.InlineKeyboardButton(
+                f"Delete {filter_term}",
+                callback_data=edit_filter.new(chat_id=callback_data['chat_id'],
+                                              subscription=callback_data['name'],
+                                              value=filter_term,
+                                              action='delete')),
+        )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            f"Add new filter",
+            callback_data=edit_filter.new(chat_id=callback_data['chat_id'],
+                                          subscription=callback_data['name'],
+                                          value='',
+                                          action='add')),
+    )
+
+    await query.message.reply(f'Edit filters', reply_markup=markup)
+
+
+@dp.callback_query_handler(edit_filter.filter(action='add'))
+async def add_filter(query: types.CallbackQuery, callback_data: Dict[str, str]):
+    await query.message.reply(f"Send your filter text")
+    chat = chats[str(callback_data['chat_id'])]
+    chat.awaiting_filter = callback_data['subscription']
+
+
+@dp.callback_query_handler(edit_filter.filter(action='delete'))
+async def delete_filter(query: types.CallbackQuery, callback_data: Dict[str, str]):
+    chat = chats[str(callback_data['chat_id'])]
+    chat.filters[callback_data['subscription']].remove(callback_data['value'])
+    await query.message.reply(f"Removed {callback_data['value']} from filters")
 
 
 @dp.message_handler(commands=['search'])
@@ -189,17 +230,22 @@ async def search_by_rule(query: types.CallbackQuery, callback_data: Dict[str, st
             await send_tweet(tweet, chat)
 
 
-@dp.message_handler(regexp=r'^[\D/]')
-async def add_rule_handler(message: types.Message) -> None:
+@dp.message_handler()
+async def handle_input(message: types.Message) -> None:
     if str(message.chat.id) not in chats:
         chats[str(message.chat.id)] = Chat(id=message.chat.id, last_sent_id={}, subscriptions={})
 
     chat = chats[str(message.chat.id)]
-    chat.subscriptions[message.text] = Twitter().get_user_info(message.text).rest_id
+
+    if chat.awaiting_filter:
+        chat.filters[chat.awaiting_filter] = chat.filters.get(chat.awaiting_filter, []) + [message.text]
+        chat.awaiting_filter = ''
+        await message.reply(f"Successfully added filter {message.text}")
+    else:
+        chat.subscriptions[message.text] = Twitter().get_user_info(message.text).rest_id
+        await message.reply(f"Successfully added subscription {message.text}")
 
     serialize()
-
-    await message.reply(f"Successfully added rule {message.text}")
 
 
 if __name__ == '__main__':
