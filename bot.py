@@ -32,8 +32,8 @@ bot = Bot(token=os.environ['TELEGRAM_BOT_ID'])
 dp = Dispatcher(bot)
 chats: Dict[str, Chat] = dict()
 edit_subscription = CallbackData('subscription', 'chat_id', 'name', 'action')
-edit_filter = CallbackData('filter', 'chat_id', 'subscription', 'action', 'value')
-search_cb = CallbackData('search', 'chat_id', 'rule_id')
+edit_filter = CallbackData('filter', 'chat_id', 'subscription', 'action', 'idx')
+search_cb = CallbackData('search', 'chat_id', 'subscription')
 forward_tasks = dict()
 
 
@@ -161,13 +161,13 @@ async def edit_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
     chat = chats[str(callback_data['chat_id'])]
 
     markup = types.InlineKeyboardMarkup()
-    for filter_term in chat.filters.get(callback_data['name'], []):
+    for idx, filter_term in enumerate(chat.filters.get(callback_data['name'], [])):
         markup.add(
             types.InlineKeyboardButton(
                 f"Delete {filter_term}",
                 callback_data=edit_filter.new(chat_id=callback_data['chat_id'],
                                               subscription=callback_data['name'],
-                                              value=filter_term,
+                                              idx=idx,
                                               action='delete')),
         )
 
@@ -176,7 +176,7 @@ async def edit_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
             f"Add new filter",
             callback_data=edit_filter.new(chat_id=callback_data['chat_id'],
                                           subscription=callback_data['name'],
-                                          value='',
+                                          idx=0,
                                           action='add')),
     )
 
@@ -194,9 +194,9 @@ async def add_filter(query: types.CallbackQuery, callback_data: Dict[str, str]):
 @dp.callback_query_handler(edit_filter.filter(action='delete'))
 async def delete_filter(query: types.CallbackQuery, callback_data: Dict[str, str]):
     chat = chats[str(callback_data['chat_id'])]
-    chat.filters[callback_data['subscription']].remove(callback_data['value'])
+    chat.filters[callback_data['subscription']].pop(int(callback_data['idx']))
     serialize()
-    await query.message.reply(f"Removed {callback_data['value']} from filters")
+    await query.message.reply(f"Removed {callback_data['idx']} index from filters")
 
 
 @dp.message_handler(commands=['search'])
@@ -212,7 +212,7 @@ async def search_menu(message: types.Message):
         markup.add(
             types.InlineKeyboardButton(
                 term,
-                callback_data=search_cb.new(chat_id=message.chat.id, rule_id=term)),
+                callback_data=search_cb.new(chat_id=message.chat.id, subscription=term)),
         )
 
     await message.reply(f'Pick a rule to use for search', reply_markup=markup)
@@ -220,16 +220,21 @@ async def search_menu(message: types.Message):
 
 @dp.callback_query_handler(search_cb.filter())
 async def search_by_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
-    await query.answer(f"Fetching rules")
+    await query.answer(f"Fetching tweets")
 
     chat = chats[str(callback_data['chat_id'])]
-    api = Twitter()
-    for name in chat.subscriptions.keys():
-        for tweet in api.get_tweets(name):
-            if not tweet.media:
-                continue
+    subscription = chat.subscriptions[callback_data['subscription']]
+    filters = chat.filters.get(callback_data['subscription'], [])
 
+    api = Twitter()
+
+    for tweet in api.get_tweets(subscription):
+        if not tweet.media:
+            continue
+
+        if not filters or any(map(lambda term: term.lower() in tweet.text.lower(), filters)):
             await send_tweet(tweet, chat)
+            break
 
 
 @dp.message_handler()
