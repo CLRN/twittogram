@@ -152,7 +152,7 @@ async def edit_rules(message: types.Message):
                 callback_data=edit_subscription.new(chat_id=message.chat.id, name=name, action='edit')),
         )
 
-    await message.reply(f'Delete subscription rules', reply_markup=markup)
+    await message.reply(f'Edit subscription rules', reply_markup=markup)
 
 
 @dp.callback_query_handler(edit_subscription.filter(action='edit'))
@@ -179,8 +179,24 @@ async def edit_rule(query: types.CallbackQuery, callback_data: Dict[str, str]):
                                           idx=0,
                                           action='add')),
     )
-
+    markup.add(
+        types.InlineKeyboardButton(
+            f"Delete subscription",
+            callback_data=edit_subscription.new(chat_id=callback_data['chat_id'],
+                                                name=callback_data['name'],
+                                                action='delete')),
+    )
     await query.message.reply(f'Edit filters', reply_markup=markup)
+
+
+@dp.callback_query_handler(edit_subscription.filter(action='delete'))
+async def delete_subscription(query: types.CallbackQuery, callback_data: Dict[str, str]):
+    chat = chats[str(callback_data['chat_id'])]
+    if callback_data['name'] in chat.filters:
+        chat.filters.pop(callback_data['name'])
+    chat.subscriptions.pop(callback_data['name'])
+    serialize()
+    await query.message.reply(f"Removed {callback_data['name']} from subscriptions")
 
 
 @dp.callback_query_handler(edit_filter.filter(action='add'))
@@ -249,8 +265,11 @@ async def handle_input(message: types.Message) -> None:
         chat.awaiting_filter = ''
         await message.reply(f"Successfully added filter {message.text}")
     else:
-        chat.subscriptions[message.text] = Twitter().get_user_info(message.text).rest_id
-        await message.reply(f"Successfully added subscription {message.text}")
+        try:
+            chat.subscriptions[message.text] = Twitter().get_user_info(message.text).rest_id
+            await message.reply(f"Successfully added subscription {message.text}")
+        except Exception as e:
+            await message.reply(str(e))
 
     serialize()
 
